@@ -65,3 +65,5 @@ struct pond_it
 
 inline bool pond_it_end(struct pond_it it) { return it.it == it.end; }
 size_t pond_it_read(struct pond_it *, uint8_t *dst, size_t len);
+
+inline struct pond_it pond_it_nil(void) { return (struct pond_it) {0}; }
