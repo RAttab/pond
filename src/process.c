@@ -8,6 +8,7 @@
 
 #include <unistd.h>
 #include <stdatomic.h>
+#include <sched.h>
 
 // -----------------------------------------------------------------------------
 // utils
@@ -25,13 +26,20 @@ size_t pond_tid(void)
 }
 
 
-
-
 size_t pond_cpus(void)
 {
     long count = sysconf(_SC_NPROCESSORS_ONLN);
     if (count != -1) return count;
 
     pond_fail_errno("unable to call sysconf to get cpu count");
+    pond_abort();
+}
+
+size_t pond_cpu(void)
+{
+    int cpu = sched_getcpu();
+    if (cpu != -1) return cpu;
+
+    pond_fail_errno("unable to call getcpu to get current cpu");
     pond_abort();
 }

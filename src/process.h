@@ -13,4 +13,5 @@
 
 size_t pond_tid(void);
 size_t pond_cpus(void);
+size_t pond_cpu(void);
 
