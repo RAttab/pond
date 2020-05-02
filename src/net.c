@@ -6,6 +6,8 @@
 #include "net.h"
 #include "errors.h"
 #include "process.h"
+#include "math.h"
+#include "buf.h"
 
 #include <stdio.h>
 #include <bsd/string.h>
@@ -105,6 +107,138 @@ void pond_host_free(struct pond_host *host)
     free(host);
 }
 
+// -----------------------------------------------------------------------------
+// iovec
+// -----------------------------------------------------------------------------
+
+
+size_t pond_iov_write(struct pond_iov *iov, const uint8_t *src, size_t len)
+{
+    iov->len = pond_min(len, iov->cap);
+    memcpy(iov->bin, src, iov->len);
+    return iov->len;
+}
+
+size_t pond_iov_append(struct pond_iov *iov, const uint8_t *src, size_t len)
+{
+    len = pond_min(len, iov->cap - iov->len);
+    memcpy(iov->bin + iov->len, src, len);
+    iov->len += len;
+    return len;
+}
+
+
+size_t pond_iov_read(const struct pond_iov *iov, uint8_t *dst, size_t len)
+{
+    len = pond_min(len, iov->len);
+    memcpy(dst, iov->bin, len);
+    return len;
+}
+
+struct pond_it pond_iov_it(struct pond_iov *iov)
+{
+    return (struct pond_it) {.it = iov->bin, .end = iov->bin + iov->cap };
+}
+
+
+static size_t iovec_len(const size_t *sizes, size_t cap)
+{
+    size_t sum = 0;
+    for (size_t i = 0; i < cap; ++i) sum += sizes[0];
+
+    return sizeof(struct pond_iovec) + sizeof(struct pond_iov) * cap + sum;
+}
+
+static void iovec_init(struct pond_iovec *iovec, const size_t *sizes, size_t cap)
+{
+    *iovec = (struct pond_iovec) { .cap = cap };
+
+    size_t header_len = sizeof(struct pond_iovec) + sizeof(struct pond_iov) * cap;
+    uint8_t *bin = ((uint8_t *) iovec) + header_len;
+
+    for (size_t i = 0; i < cap; ++i) {
+        struct pond_iov *iov = &iovec->vec[i];
+        *iov = (struct pond_iov) {
+            .cap = sizes[i],
+            .bin = sizes[i] ? bin : NULL
+        };
+        bin += sizes[i];
+    }
+}
+
+struct pond_iovec *pond_iovec_alloc(const size_t *sizes, size_t cap)
+{
+    struct pond_iovec *iovec = calloc(1, iovec_len(sizes, cap));
+    pond_assert_alloc(iovec);
+    iovec_init(iovec, sizes, cap);
+    return iovec;
+}
+
+void pond_iovec_free(struct pond_iovec *iovec)
+{
+    free(iovec);
+}
+
+// -----------------------------------------------------------------------------
+// mmsg
+// -----------------------------------------------------------------------------
+
+struct pond_mmsg
+{
+    size_t len, cap;
+    size_t iovecs_len;
+    struct msghdr headers[];
+};
+
+struct pond_mmsg *pond_mmsg_alloc(size_t msg_cap, const size_t *iov_sizes, size_t iov_cap)
+{
+    size_t headers_len = sizeof(struct msghdr) * msg_cap;
+    size_t iovecs_len = iovec_len(iov_sizes, iov_cap) * msg_cap;
+    struct pond_mmsg *mmsg = calloc(1, sizeof(*mmsg) + headers_len + iovecs_len);
+    pond_assert_alloc(mmsg);
+
+    *mmsg = (struct pond_mmsg) { .cap = msg_cap, .iovecs_len = iovecs_len };
+
+    for (size_t i = 0; i < msg_cap; ++i) {
+        struct msghdr *hdr = &mmsg->headers[i];
+        struct pond_iovec *iov = pond_mmsg_iovec(mmsg, i);
+
+        hdr->msg_iov = pond_iov_sys(iov);
+        iovec_init(iov, iov_sizes, iov_cap);
+    }
+
+    return mmsg;
+}
+
+void pond_mmsg_free(struct pond_mmsg *mmsg)
+{
+    free(mmsg);
+}
+
+
+size_t pond_mmsg_len(const struct pond_mmsg *mmsg)
+{
+    return mmsg->len;
+}
+
+size_t pond_mmsg_cap(const struct pond_mmsg *mmsg)
+{
+    return mmsg->cap;
+}
+
+
+struct msghdr *pond_mmsg_header(struct pond_mmsg *mmsg, size_t i)
+{
+    return &mmsg->headers[i];
+}
+
+struct pond_iovec *pond_mmsg_iovec(struct pond_mmsg *mmsg, size_t i)
+{
+    return ((void *) mmsg) + sizeof(*mmsg) +
+        sizeof(mmsg->headers[0]) * mmsg->cap +
+        mmsg->iovecs_len * i;
+}
+
 
 // -----------------------------------------------------------------------------
 // udp
@@ -114,9 +248,6 @@ struct pond_udp
 {
     int fd;
     struct pond_udp_opt opt;
-
-    struct mmsghdr *it, *end;
-    struct mmsghdr queue[];
 };
 
 static int udp_socket(const struct pond_host *host, const struct pond_udp_opt *opt)
@@ -139,11 +270,15 @@ static int udp_socket(const struct pond_host *host, const struct pond_udp_opt *o
         fd = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
         if (fd == -1) continue;
 
-        int cpu = pond_cpu();
-        if (setsockopt(fd, SOL_SOCKET, SO_INCOMING_CPU, &cpu, sizeof(cpu)) == -1) goto fail_sockopt;
+        if (opt->cpu_affinity) {
+            int cpu = pond_cpu();
+            if (setsockopt(fd, SOL_SOCKET, SO_INCOMING_CPU, &cpu, sizeof(cpu)) == -1)
+                goto fail_sockopt;
+        }
 
         if (opt->reuse_port) {
-            if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, NULL, 0) == -1) goto fail_sockopt;
+            if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, NULL, 0) == -1)
+                goto fail_sockopt;
         }
 
         if (!bind(fd, addr->ai_addr, addr->ai_addrlen)) break;
@@ -172,14 +307,11 @@ struct pond_udp *pond_udp_server(const struct pond_host *host, const struct pond
     int fd = udp_socket(host, opt);
     if (fd == -1) return NULL;
 
-    struct pond_udp *udp = calloc(1, sizeof(*udp) + sizeof(udp->queue[0]) * opt->queue_len);
+    struct pond_udp *udp = calloc(1, sizeof(*udp));
     pond_assert_alloc(udp);
 
     udp->fd = fd;
     udp->opt = *opt;
-    udp->it = udp->queue;
-    udp->end = udp->queue;
-
     return udp;
 }
 
@@ -192,6 +324,9 @@ void pond_udp_close(struct pond_udp *udp)
 bool pond_udp_recv(struct pond_udp *udp, struct pond_it *dst, size_t len)
 {
     (void) udp; (void) dst; (void) len;
+
+
+
     return true;
 }
 
