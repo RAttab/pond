@@ -39,3 +39,11 @@
 #define pond_no_opt()         pond_asm volatile ("")
 #define pond_no_opt_val(x)    pond_asm volatile ("" : "+r" (x))
 #define pond_no_opt_clobber() pond_asm volatile ("" : : : "memory")
+
+
+// -----------------------------------------------------------------------------
+// utils
+// -----------------------------------------------------------------------------
+
+#define pond_static_assert(p) _Static_assert(p)
+#define pond_sizeof_member(type, member) sizeof(((type *) 0)->member)
