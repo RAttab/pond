@@ -10,7 +10,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
-
+#include <alloca.h>
 
 // -----------------------------------------------------------------------------
 // bytes
@@ -21,6 +21,12 @@ struct pond_bin
     size_t len, cap;
     uint8_t d[];
 };
+
+#define pond_bin_alloca(cap)                                            \
+    ({                                                                  \
+        struct pond_bin *bin = alloca(sizeof(struct pond_bin) + cap);   \
+        *bin = (struct pond_bin) { .cap = cap };                        \
+    })
 
 struct pond_bin *pond_bin_alloc(size_t cap) pond_malloc;
 void pond_bin_free(struct pond_bin *);
